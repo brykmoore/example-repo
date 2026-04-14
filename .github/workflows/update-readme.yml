@@ -1,0 +1,113 @@
+name: AI README Updater
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths-ignore:
+      - 'README.md'  # Avoid infinite loop
+
+permissions:
+  contents: write
+  pull-requests: write
+  models: read
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- . ':(exclude)README.md' | head -c 12000)
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Read current README
+        id: readme
+        run: |
+          README=$(cat README.md 2>/dev/null || echo "# Project\n\nNo README yet.")
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          echo "$README" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call GitHub Models API
+        id: ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DIFF='${{ steps.diff.outputs.diff }}'
+          README='${{ steps.readme.outputs.content }}'
+
+          DIFF_ESCAPED=$(echo "$DIFF" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          README_ESCAPED=$(echo "$README" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          PAYLOAD=$(cat <<JSONEOF
+          {
+            "model": "openai/gpt-4.1",
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a technical writer. Given a git diff and the current README, update the README to reflect significant changes: new files, removed features, changed APIs, new dependencies, config changes. Preserve existing structure. Only update sections relevant to the diff. Return ONLY the full updated README in markdown, no commentary."
+              },
+              {
+                "role": "user",
+                "content": "Current README:\n${README_ESCAPED}\n\nGit diff:\n${DIFF_ESCAPED}\n\nReturn the updated README."
+              }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4096
+          }
+          JSONEOF
+          )
+
+          RESPONSE=$(curl -s -X POST \
+            "https://models.github.ai/inference/chat/completions" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          content = data['choices'][0]['message']['content']
+          with open('README.md', 'w') as f:
+              f.write(content)
+          print('README updated successfully')
+          "
+
+      - name: Check for changes
+        id: changes
+        run: |
+          git diff --quiet README.md && echo "changed=false" >> $GITHUB_OUTPUT || echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Commit updated README
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: auto-update README based on PR changes [skip ci]"
+          git push
+
+      - name: Comment on PR
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '📝 **README auto-updated** by AI based on the changes in this PR.\n\nReview the commit to ensure the updates look accurate.'
+            })
