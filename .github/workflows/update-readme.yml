@@ -1,8 +1,9 @@
 name: AI README Updater
 
 on:
-  pull_request:
-    types: [opened, synchronize]
+  push:
+    branches:
+      - main
     paths-ignore:
       - 'README.md'
 
@@ -19,14 +20,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          ref: ${{ github.head_ref }}
+          fetch-depth: 2  # need HEAD and HEAD~1 to diff
 
-      - name: Get PR diff
-        id: diff
+      - name: Get diff of merged commit
         run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff origin/${{ github.base_ref }}...HEAD -- . ':(exclude)README.md' | head -c 12000 > /tmp/pr.diff
+          git diff HEAD~1 HEAD -- . ':(exclude)README.md' | head -c 12000 > /tmp/pr.diff
           echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
 
       - name: Call GitHub Models API and update README
@@ -34,10 +32,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 << 'PYEOF'
-          import json, os, sys, urllib.request
+          import json, os, urllib.request
 
-          diff = open("/tmp/pr.diff").read()
+          diff = open("/tmp/pr.diff").read().strip()
           readme = open("README.md").read() if os.path.exists("README.md") else "# Project\n\nNo README yet."
+
+          if not diff:
+            print("No relevant diff found, skipping.")
+            open("/tmp/readme_changed", "w").write("false")
+            exit(0)
 
           payload = json.dumps({
             "model": "openai/gpt-4.1",
@@ -77,32 +80,49 @@ jobs:
             data = json.loads(resp.read())
 
           updated = data["choices"][0]["message"]["content"]
-          open("README.md", "w").write(updated)
-          print("README updated successfully")
+
+          if updated.strip() == readme.strip():
+            print("No README changes needed.")
+            open("/tmp/readme_changed", "w").write("false")
+          else:
+            open("README.md", "w").write(updated)
+            open("/tmp/readme_changed", "w").write("true")
+            print("README updated successfully.")
           PYEOF
 
-      - name: Check for changes
-        id: changes
+      - name: Push branch and open PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git diff --quiet README.md && echo "changed=false" >> $GITHUB_OUTPUT || echo "changed=true" >> $GITHUB_OUTPUT
+          changed=$(cat /tmp/readme_changed)
+          if [ "$changed" != "true" ]; then
+            echo "No changes, skipping PR creation."
+            exit 0
+          fi
 
-      - name: Commit updated README
-        if: steps.changes.outputs.changed == 'true'
-        run: |
+          BRANCH="docs/auto-readme-$(date +%Y%m%d-%H%M%S)"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
           git add README.md
-          git commit -m "docs: auto-update README based on PR changes [skip ci]"
-          git push
+          git commit -m "docs: auto-update README based on recent changes"
+          git push origin "$BRANCH"
 
-      - name: Comment on PR
-        if: steps.changes.outputs.changed == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '📝 **README auto-updated** by AI based on the changes in this PR.\n\nReview the commit to ensure the updates look accurate.'
-            })
+          # Get the commit message that triggered this run
+          TRIGGER_MSG=$(git log -1 --pretty=%s HEAD~1 2>/dev/null || echo "recent changes")
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "docs: update README" \
+            --body "$(cat <<EOF
+          ## 📝 Auto-generated README update
+
+          This PR was automatically created after the following commit was merged into \`main\`:
+
+          > $TRIGGER_MSG
+
+          Please review the changes to ensure they are accurate before merging.
+          EOF
+          )"
