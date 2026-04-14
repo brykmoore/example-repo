@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize]
     paths-ignore:
-      - 'README.md'  # Avoid infinite loop
+      - 'README.md'
 
 permissions:
   contents: write
@@ -26,65 +26,60 @@ jobs:
         id: diff
         run: |
           git fetch origin ${{ github.base_ref }}
-          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- . ':(exclude)README.md' | head -c 12000)
-          echo "diff<<EOF" >> $GITHUB_OUTPUT
-          echo "$DIFF" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          git diff origin/${{ github.base_ref }}...HEAD -- . ':(exclude)README.md' | head -c 12000 > /tmp/pr.diff
+          echo "Diff size: $(wc -c < /tmp/pr.diff) bytes"
 
-      - name: Read current README
-        id: readme
-        run: |
-          README=$(cat README.md 2>/dev/null || echo "# Project\n\nNo README yet.")
-          echo "content<<EOF" >> $GITHUB_OUTPUT
-          echo "$README" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Call GitHub Models API
-        id: ai
+      - name: Call GitHub Models API and update README
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DIFF='${{ steps.diff.outputs.diff }}'
-          README='${{ steps.readme.outputs.content }}'
+          python3 << 'PYEOF'
+          import json, os, sys, urllib.request
 
-          DIFF_ESCAPED=$(echo "$DIFF" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
-          README_ESCAPED=$(echo "$README" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          diff = open("/tmp/pr.diff").read()
+          readme = open("README.md").read() if os.path.exists("README.md") else "# Project\n\nNo README yet."
 
-          PAYLOAD=$(cat <<JSONEOF
-          {
+          payload = json.dumps({
             "model": "openai/gpt-4.1",
+            "temperature": 0.3,
+            "max_tokens": 4096,
             "messages": [
               {
                 "role": "system",
-                "content": "You are a technical writer. Given a git diff and the current README, update the README to reflect significant changes: new files, removed features, changed APIs, new dependencies, config changes. Preserve existing structure. Only update sections relevant to the diff. Return ONLY the full updated README in markdown, no commentary."
+                "content": (
+                  "You are a technical writer. Given a git diff and the current README, "
+                  "update the README to reflect significant changes: new files, removed features, "
+                  "changed APIs, new dependencies, config changes. Preserve existing structure. "
+                  "Only update sections relevant to the diff. "
+                  "Return ONLY the full updated README in markdown, no commentary."
+                )
               },
               {
                 "role": "user",
-                "content": "Current README:\n${README_ESCAPED}\n\nGit diff:\n${DIFF_ESCAPED}\n\nReturn the updated README."
+                "content": f"Current README:\n{readme}\n\nGit diff:\n{diff}\n\nReturn the updated README."
               }
-            ],
-            "temperature": 0.3,
-            "max_tokens": 4096
-          }
-          JSONEOF
+            ]
+          }).encode()
+
+          req = urllib.request.Request(
+            "https://models.github.ai/inference/chat/completions",
+            data=payload,
+            headers={
+              "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+              "Content-Type": "application/json",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+            },
+            method="POST"
           )
 
-          RESPONSE=$(curl -s -X POST \
-            "https://models.github.ai/inference/chat/completions" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+          with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
 
-          echo "$RESPONSE" | python3 -c "
-          import sys, json
-          data = json.load(sys.stdin)
-          content = data['choices'][0]['message']['content']
-          with open('README.md', 'w') as f:
-              f.write(content)
-          print('README updated successfully')
-          "
+          updated = data["choices"][0]["message"]["content"]
+          open("README.md", "w").write(updated)
+          print("README updated successfully")
+          PYEOF
 
       - name: Check for changes
         id: changes
